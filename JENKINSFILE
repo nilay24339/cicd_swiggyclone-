@@ -1,0 +1,122 @@
+pipeline {
+  agent any
+
+  tools {
+    jdk 'jdk21'
+  }
+
+  environment {
+    SCANNER_HOME       = tool 'sonar-scanner'
+    SONAR_PROJECT_KEY  = 'Swiggy-CI'
+    SONAR_PROJECT_NAME = 'Swiggy-CI'
+
+    AWS_REGION   = 'ap-south-1'
+    CLUSTER_NAME = 'virtualtechbox-cluster'
+    NAMESPACE    = 'swiggy'
+
+    // build-specific tag so every deployment is unique
+    DOCKER_IMAGE = "nilay2497/swiggy-clone:${BUILD_NUMBER}"
+  }
+
+  stages {
+
+    stage('Clean Workspace') {
+      steps {
+        cleanWs()
+      }
+    }
+
+    stage('Checkout') {
+      steps {
+        git branch: 'main', url: 'https://github.com/nilay24339/cicd_swiggyclone-.git'
+      }
+    }
+
+    stage('Node Setup + Install Dependencies') {
+      steps {
+        script {
+          def nodeHome = tool name: 'Node16', type: 'jenkins.plugins.nodejs.tools.NodeJSInstallation'
+          env.PATH = "${nodeHome}/bin:${env.PATH}"
+        }
+        sh '''
+          node -v
+          npm -v
+          npm ci || npm install
+        '''
+      }
+    }
+
+    stage('SonarQube Analysis') {
+      steps {
+        withSonarQubeEnv('SonarQube-Server') {
+          sh '''
+            ${SCANNER_HOME}/bin/sonar-scanner \
+              -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+              -Dsonar.projectName=${SONAR_PROJECT_NAME} \
+              -Dsonar.sources=. \
+              -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/.git/**
+          '''
+        }
+      }
+    }
+
+    stage('Quality Gate') {
+      steps {
+        timeout(time: 5, unit: 'MINUTES') {
+          waitForQualityGate abortPipeline: true
+        }
+      }
+    }
+
+    stage('TRIVY FS SCAN') {
+      steps {
+        sh '''
+          trivy fs --no-progress --severity HIGH,CRITICAL . | tee trivyfs.txt
+        '''
+      }
+    }
+
+    stage('Docker Build & Push') {
+      steps {
+        script {
+          withDockerRegistry(credentialsId: 'dockerhub') {
+            sh '''
+              docker build -t swiggy-clone .
+              docker tag swiggy-clone ${DOCKER_IMAGE}
+              docker push ${DOCKER_IMAGE}
+            '''
+          }
+        }
+      }
+    }
+
+    stage('TRIVY IMAGE SCAN') {
+      steps {
+        sh '''
+          trivy image --no-progress --severity HIGH,CRITICAL \
+          ${DOCKER_IMAGE} | tee trivyimage.txt
+        '''
+      }
+    }
+
+    stage('Deploy to Kubernets') {
+      steps {
+        script {
+          dir('Kubernetes') {
+            kubeconfig(credentialsId: 'kubernetes', serverUrl: '') {
+              sh 'kubectl delete --all pods'
+              sh 'kubectl apply -f deployment.yml'
+              sh 'kubectl apply -f service.yml'
+            }
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'trivyfs.txt,trivyimage.txt', onlyIfSuccessful: false
+    }
+  }
+}
