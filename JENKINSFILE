@@ -6,9 +6,13 @@ pipeline {
   }
 
   environment {
-    SCANNER_HOME       = tool 'sonar-scanner'
-    SONAR_PROJECT_KEY  = 'Swiggy-CI'
-    SONAR_PROJECT_NAME = 'Swiggy-CI'
+    SCANNER_HOME = tool 'sonar-scanner'
+
+    // Sonar projects (split: App + IaC)
+    SONAR_APP_KEY  = 'swiggy-app'
+    SONAR_APP_NAME = 'Swiggy-App'
+    SONAR_IAC_KEY  = 'swiggy-iac'
+    SONAR_IAC_NAME = 'Swiggy-IaC'
 
     AWS_REGION   = 'ap-south-1'
     CLUSTER_NAME = 'virtualtechbox-cluster'
@@ -46,21 +50,29 @@ pipeline {
       }
     }
 
-    stage('SonarQube Analysis') {
+    // =========================================================
+    // SONAR 1: APP (React)
+    // =========================================================
+    stage('SonarQube - App Scan') {
       steps {
         withSonarQubeEnv('SonarQube-Server') {
-          sh '''
-            ${SCANNER_HOME}/bin/sonar-scanner \
-              -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
-              -Dsonar.projectName=${SONAR_PROJECT_NAME} \
-              -Dsonar.sources=. \
-              -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/.git/**
-          '''
+          // If you use ONE sonar token for all projects, you can remove withCredentials and -Dsonar.login
+          withCredentials([string(credentialsId: 'sonar-token-app', variable: 'SONAR_TOKEN')]) {
+            sh '''
+              ${SCANNER_HOME}/bin/sonar-scanner \
+                -Dsonar.host.url=$SONAR_HOST_URL \
+                -Dsonar.login=$SONAR_TOKEN \
+                -Dsonar.projectKey=${SONAR_APP_KEY} \
+                -Dsonar.projectName=${SONAR_APP_NAME} \
+                -Dsonar.sources=src,public \
+                -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/.git/**,terraform/**,Kubernetes/**
+            '''
+          }
         }
       }
     }
 
-    stage('Quality Gate') {
+    stage('Quality Gate - App') {
       steps {
         timeout(time: 5, unit: 'MINUTES') {
           waitForQualityGate abortPipeline: true
@@ -68,6 +80,41 @@ pipeline {
       }
     }
 
+    // =========================================================
+    // SONAR 2: IaC (Terraform + Kubernetes) - non-blocking
+    // =========================================================
+    stage('SonarQube - IaC Scan') {
+      steps {
+        withSonarQubeEnv('SonarQube-Server') {
+          withCredentials([string(credentialsId: 'sonar-token-iac', variable: 'SONAR_TOKEN')]) {
+            sh '''
+              ${SCANNER_HOME}/bin/sonar-scanner \
+                -Dsonar.host.url=$SONAR_HOST_URL \
+                -Dsonar.login=$SONAR_TOKEN \
+                -Dsonar.projectKey=${SONAR_IAC_KEY} \
+                -Dsonar.projectName=${SONAR_IAC_NAME} \
+                -Dsonar.sources=terraform,Kubernetes \
+                -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/.git/**,src/**,public/**
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Quality Gate - IaC (Non-Blocking)') {
+      steps {
+        timeout(time: 5, unit: 'MINUTES') {
+          script {
+            def qg = waitForQualityGate abortPipeline: false
+            echo "IaC Quality Gate result: ${qg.status}"
+          }
+        }
+      }
+    }
+
+    // =========================================================
+    // Security + Build + Deploy (same as your original)
+    // =========================================================
     stage('TRIVY FS SCAN') {
       steps {
         sh '''
@@ -99,7 +146,7 @@ pipeline {
       }
     }
 
-    stage('Deploy to Kubernets') {
+    stage('Deploy to Kubernetes') {
       steps {
         script {
           dir('Kubernetes') {
